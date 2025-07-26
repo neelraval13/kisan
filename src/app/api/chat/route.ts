@@ -4,6 +4,7 @@ import { GoogleGenAI } from '@google/genai';
 
 import { getRetriever } from '@/lib/retriever';
 import { fetchMarketPrice, getCommoditySuggestions } from '@/lib/market';
+import { findScheme } from '@/lib/schemes'; // ← NEW
 import { SYSTEM_PROMPT } from '@/lib/prompts';
 import type { MarketRecord } from '@/types/market';
 
@@ -23,10 +24,9 @@ export async function POST(req: NextRequest) {
     const { userId, message } = await req.json();
 
     /* ──────────────  1. price-query short-circuit  ────────────── */
-    const priceMatch =
-      message.match(
-        /(?:price|rate|cost)\s+(?:of\s+)?([a-zA-Z\(\)\s]+?)(?:\s+in\s+([a-zA-Z ]+))?$/i,
-      );
+    const priceMatch = message.match(
+      /(?:price|rate|cost)\s+(?:of\s+)?([a-zA-Z\(\)\s]+?)(?:\s+in\s+([a-zA-Z ]+))?$/i,
+    );
 
     if (priceMatch) {
       const [, commodity, state] = priceMatch;
@@ -58,7 +58,25 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    /* ──────────────  2. normal chat (Gemini)  ────────────── */
+    /* ──────────────  2. scheme-query short-circuit  ────────────── */
+    try {
+      const scheme = await findScheme(message);
+      if (scheme) {
+        const reply =
+          `**${scheme.name}**\n\n` +
+          `**Objective:** ${scheme.objective}\n\n` +
+          `**Benefits:** ${scheme.benefits}\n\n` +
+          `**Eligibility:** ${scheme.eligibility}\n\n` +
+          `**How to Apply:** ${scheme.how_to_apply}`;
+        
+        return NextResponse.json({ reply });
+      }
+    } catch (error) {
+      console.error('Scheme fetch error:', error);
+      // Continue to normal chat flow if scheme lookup fails
+    }
+
+    /* ──────────────  3. normal chat (Gemini)  ────────────── */
 
     // session bookkeeping
     const hist = sessions.get(userId) ?? [];
