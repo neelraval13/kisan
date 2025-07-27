@@ -7,19 +7,78 @@ import { getRetriever } from '@/lib/retriever';
 import { fetchMarketPrice, getCommoditySuggestions } from '@/lib/market';
 import { findScheme } from '@/lib/schemes';
 import { SYSTEM_PROMPT } from '@/lib/prompts';
+import {
+  pushTurn,
+  getRecent,
+  countTurns,
+  getSummary,
+  setSummary,
+  MAX_TURNS,
+  SUM_AFTER,
+  Turn,
+} from '@/lib/session';
 import type { MarketRecord } from '@/types/market';
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
 
-type Turn = { role: 'user' | 'assistant'; content: string };
-const sessions = new Map<string, Turn[]>();
+/* ------------------------------------------------------------------ */
+/* 1. Auto-summary helper (called when turns > SUM_AFTER)            */
+/* ------------------------------------------------------------------ */
+async function summariseHistory(uid: string, recent: Turn[]) {
+  const prevSummary = (await getSummary(uid)) ?? '';
+  const textBlock = recent
+    .map((t) => `${t.role === 'user' ? 'User' : 'Assistant'}: ${t.content}`)
+    .join('\n');
 
-const toHistory = (turns: Turn[]) =>
-  turns.map((t) => ({
-    role: t.role === 'user' ? 'user' : 'model',
-    parts: [{ text: t.content }],
-  }));
+  const summaryPrompt = 
+    'Produce a concise summary (<=100 words) of this agricultural chat conversation, ' +
+    'focusing on key topics discussed, problems raised, and solutions provided.';
 
+  try {
+    const { text } = await ai.models.generateContent({
+      model: 'models/gemini-2.5-flash',
+      contents: [
+        { 
+          role: 'user', 
+          parts: [{ 
+            text: `${summaryPrompt}\n\nPrevious summary: ${prevSummary}\n\nRecent conversation:\n${textBlock}` 
+          }] 
+        }
+      ],
+    });
+
+    await setSummary(uid, text?.trim() || prevSummary);
+  } catch (error) {
+    console.error('Summary generation failed:', error);
+    // Keep previous summary if generation fails
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 2. Helper to check if response is generic/unhelpful               */
+/* ------------------------------------------------------------------ */
+function isGenericResponse(response: string): boolean {
+  if (!response || response.length < 50) return true;
+  
+  const genericPhrases = [
+    'I am unable to find',
+    'my current agricultural knowledge context does not contain',
+    'consult your local',
+    'I don\'t have specific information',
+    'please contact',
+    'I cannot provide specific',
+    'seek advice from',
+    'consult with experts',
+  ];
+  
+  return genericPhrases.some(phrase => 
+    response.toLowerCase().includes(phrase.toLowerCase())
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* 3. Main POST /api/chat                                             */
+/* ------------------------------------------------------------------ */
 export async function POST(req: NextRequest) {
   try {
     const { userId, message } = await req.json();
@@ -45,6 +104,10 @@ export async function POST(req: NextRequest) {
         if (!rows.length) {
           const enReply = `Sorry, no recent mandi price found for **${cleanCommodity}**${state ? ` in **${state}**` : ''} in the last 7 days.\n\n**Currently available:** Arecanut (Betelnut/Supari)\n\n**Try:** "price of arecanut" or "rate of arecanut in kerala"\n\n*Note: The market data API currently has very limited recent data.*`;
           
+          // Store this interaction in memory
+          await pushTurn(userId, { role: 'user', content: msgEn });
+          await pushTurn(userId, { role: 'assistant', content: enReply });
+          
           return NextResponse.json({
             reply: await toLang(enReply, userLang),
           });
@@ -58,12 +121,20 @@ export async function POST(req: NextRequest) {
           rows.map(fmt).join('\n\n') +
           `\n\n*Data from the last 7 days of market records*`;
 
+        // Store this interaction in memory
+        await pushTurn(userId, { role: 'user', content: msgEn });
+        await pushTurn(userId, { role: 'assistant', content: enReply });
+
         return NextResponse.json({ 
           reply: await toLang(enReply, userLang) 
         });
       } catch (error) {
         console.error('Price fetch error:', error);
         const enReply = `Sorry, I couldn't fetch the current market prices. The market data service might be temporarily unavailable.`;
+        
+        // Store this interaction in memory
+        await pushTurn(userId, { role: 'user', content: msgEn });
+        await pushTurn(userId, { role: 'assistant', content: enReply });
         
         return NextResponse.json({
           reply: await toLang(enReply, userLang),
@@ -82,6 +153,10 @@ export async function POST(req: NextRequest) {
           `**Eligibility:** ${scheme.eligibility}\n\n` +
           `**How to Apply:** ${scheme.how_to_apply}`;
         
+        // Store this interaction in memory
+        await pushTurn(userId, { role: 'user', content: msgEn });
+        await pushTurn(userId, { role: 'assistant', content: enReply });
+        
         return NextResponse.json({ 
           reply: await toLang(enReply, userLang) 
         });
@@ -91,55 +166,127 @@ export async function POST(req: NextRequest) {
       // Continue to normal chat flow if scheme lookup fails
     }
 
-    /* ──────────────  4. normal chat (Gemini)  ────────────── */
+    /* ──────────────  4. normal chat (Gemini first, docs as fallback)  ────────────── */
 
-    // session bookkeeping (store English for context consistency)
-    const hist = sessions.get(userId) ?? [];
-    hist.push({ role: 'user', content: msgEn });
-    if (hist.length > 12) hist.shift();
-    sessions.set(userId, hist);
+    // Store user turn in Redis
+    await pushTurn(userId, { role: 'user', content: msgEn });
 
-    // retrieval
-    const retriever = await getRetriever();
-    const docs = await retriever.getRelevantDocuments(msgEn);
-    const context = docs.map((d) => d.pageContent).join('\n\n');
+    // Fetch recent conversation history and summary
+    const recent = await getRecent(userId, MAX_TURNS);
+    const summary = (await getSummary(userId)) ?? '';
 
-    // Build the system prompt as part of the first user message
-    const systemMessage = `${SYSTEM_PROMPT}\n\n### Agricultural Knowledge Context\n${context}\n\nUser: ${msgEn}`;
+    // Convert recent turns to Gemini format
+    const toGeminiHistory = (turns: Turn[]) =>
+      turns.map((t) => ({
+        role: t.role === 'user' ? 'user' : 'model',
+        parts: [{ text: t.content }],
+      }));
 
-    // For the first message, include system prompt
-    const contents = hist.length === 1 
-      ? [
-          {
-            role: 'user',
-            parts: [{ text: systemMessage }],
-          }
-        ]
-      : [
-          // For subsequent messages, just use the conversation history with context
-          ...toHistory(hist.slice(0, -1)), // All but the last message
-          {
-            role: 'user',
-            parts: [{ text: `Context: ${context}\n\nUser: ${msgEn}` }],
-          }
-        ];
+    // Build CLEAN system message for primary call - no mention of knowledge context
+    const primarySystemPrompt = `You are an expert agricultural assistant for Indian farmers. 
 
-    const res = await ai.models.generateContent({
+Provide detailed, practical advice on:
+- Crop diseases and treatments
+- Pest management  
+- Farming techniques
+- Agricultural best practices
+- Government schemes
+- Market information
+
+Use your extensive agricultural knowledge to give specific, actionable solutions. Be confident and helpful.
+
+${summary ? `\n### Conversation Summary\n${summary}` : ''}`;
+
+    const contents = [
+      {
+        role: 'user',
+        parts: [{ text: primarySystemPrompt }],
+      },
+      ...toGeminiHistory(recent),
+    ];
+
+    // First attempt: Query Gemini directly with clean prompt
+    let res = await ai.models.generateContent({
       model: 'models/gemini-2.5-flash',
       contents,
     });
 
-    const enReply =
-      res.text?.trim() ??
-      `I'm sorry, I could not generate a response.`;
+    let enReply = res.text?.trim() ?? '';
+
+    console.log('=== PRIMARY RESPONSE ===');
+    console.log('Length:', enReply.length);
+    console.log('Content:', enReply);
+    console.log('========================');
+
+    // Check if response is generic/unhelpful
+    if (isGenericResponse(enReply)) {
+      console.log('Primary response was generic, trying with retrieval context...');
+      
+      try {
+        // NOW use your original SYSTEM_PROMPT with retrieval context
+        const retriever = await getRetriever();
+        const docs = await retriever.getRelevantDocuments(msgEn);
+        const context = docs.map((d) => d.pageContent).join('\n\n');
+
+        if (context.length > 0) {
+          console.log(`Retrieved ${docs.length} documents for context`);
+          
+          // Use your original system prompt WITH context for fallback
+          const enhancedSystemBlock =
+            `${SYSTEM_PROMPT}\n\n` +
+            (summary ? `### Conversation Summary\n${summary}\n\n` : '') +
+            `### Agricultural Knowledge Context\n${context}`;
+
+          const enhancedContents = [
+            {
+              role: 'user',
+              parts: [{ text: enhancedSystemBlock }],
+            },
+            ...toGeminiHistory(recent),
+          ];
+
+          // Retry with enhanced context
+          const enhancedRes = await ai.models.generateContent({
+            model: 'models/gemini-2.5-flash',
+            contents: enhancedContents,
+          });
+
+          const enhancedReply = enhancedRes.text?.trim();
+          
+          // Use enhanced response if it's better than the original
+          if (enhancedReply && 
+              enhancedReply.length > enReply.length && 
+              !isGenericResponse(enhancedReply)) {
+            enReply = enhancedReply;
+            console.log('Used retrieval context for improved response');
+          }
+        } else {
+          console.log('No relevant documents found in retrieval');
+        }
+      } catch (retrievalError) {
+        console.error('Retrieval fallback failed:', retrievalError);
+        // Keep the original response if retrieval fails
+      }
+    }
+
+    // Final fallback if still no good response
+    if (!enReply) {
+      enReply = `I'm sorry, I could not generate a response. Please try rephrasing your question.`;
+    }
+
+    // Store assistant response in Redis
+    await pushTurn(userId, { role: 'assistant', content: enReply });
+
+    // Auto-summarise if conversation is getting too long
+    if ((await countTurns(userId)) > SUM_AFTER) {
+      await summariseHistory(userId, recent);
+    }
 
     // Translate response to user's language
     const localizedReply = await toLang(enReply, userLang);
-
-    // Store English response in history for context consistency
-    hist.push({ role: 'assistant', content: enReply });
     
     return NextResponse.json({ reply: localizedReply });
+    
   } catch (err) {
     console.error('Chat API Error:', err);
     const enError = 'Failed to generate response';
