@@ -16,11 +16,15 @@ const ChatPage = () => {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState('');
   const [uploading, setUploading] = useState(false);
-  const userIdRef = useRef('');
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [recording, setRecording] = useState(false);
 
-  /* one-time anon id */
+  const userIdRef   = useRef('');
+  const scrollRef   = useRef<HTMLDivElement>(null);
+  const fileInput   = useRef<HTMLInputElement>(null);
+  const mediaRecRef = useRef<MediaRecorder | null>(null);
+  const chunksRef   = useRef<Blob[]>([]);
+
+  /* one-time anonymous uid */
   useEffect(() => {
     let id = localStorage.getItem('kisan_uid');
     if (!id) {
@@ -30,49 +34,84 @@ const ChatPage = () => {
     userIdRef.current = id;
   }, []);
 
-  /* auto-scroll on new message */
+  /* auto-scroll on new turn */
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [turns]);
 
-  /* ─────────────────── text prompt handler ─────────────────── */
-  const sendText = async () => {
-    const prompt = input.trim();
+  /* ─────────────────── helpers ─────────────────── */
+
+  /** send a text prompt (from input or override) */
+  const sendText = async (promptOverride?: string) => {
+    const prompt = (promptOverride ?? input).trim();
     if (!prompt) return;
 
     setTurns((t) => [...t, { role: 'user', text: prompt }]);
     setInput('');
 
-    const res = await fetch('/api/chat', {
-      method: 'POST',
+    const res  = await fetch('/api/chat', {
+      method : 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId: userIdRef.current, message: prompt }),
+      body   : JSON.stringify({ userId: userIdRef.current, message: prompt }),
     });
     const { reply } = await res.json();
     setTurns((t) => [...t, { role: 'bot', text: reply }]);
   };
 
-  /* ─────────────────── image upload handler ─────────────────── */
+  /** upload image and get diagnosis */
   const sendImage = async () => {
-    const file = fileInputRef.current?.files?.[0];
+    const file = fileInput.current?.files?.[0];
     if (!file) return;
 
     setUploading(true);
-    setTurns((t) => [...t, { role: 'user', text: '[🖼️ image uploaded]' }]);
+    setTurns((t) => [...t, { role: 'user', text: '🖼️ [image uploaded]' }]);
 
     const form = new FormData();
-    form.append('image', file);
+    form.append('image', file, file.name);
 
-    const res = await fetch('/api/analyze-image', {
-      method: 'POST',
-      body: form,
-    });
+    const res = await fetch('/api/analyze-image', { method: 'POST', body: form });
     const { answer } = await res.json();
 
     setTurns((t) => [...t, { role: 'bot', text: answer }]);
     setUploading(false);
-    if (fileInputRef.current) fileInputRef.current.value = '';
+    if (fileInput.current) fileInput.current.value = '';
   };
+
+  /** start voice recording */
+  const startRec = async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const rec    = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+
+    mediaRecRef.current = rec;
+    chunksRef.current = [];
+    rec.ondataavailable = (e) => chunksRef.current.push(e.data);
+
+    rec.onstop = async () => {
+      setRecording(false);
+
+      const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
+      if (blob.size < 1024) return; // skip empty
+
+      setTurns((t) => [...t, { role: 'user', text: '🎤 [voice message]' }]);
+
+      const form = new FormData();
+      form.append('audio', blob, 'voice.webm');
+
+      const res = await fetch('/api/transcribe', { method: 'POST', body: form });
+      const { text } = await res.json();
+
+      if (text) {
+        await sendText(text);   // reuse normal flow
+      } else {
+        setTurns((t) => [...t, { role: 'bot', text: 'Could not transcribe audio.' }]);
+      }
+    };
+
+    rec.start();
+    setRecording(true);
+  };
+
+  const stopRec = () => mediaRecRef.current?.stop();
 
   /* ─────────────────── render ─────────────────── */
   return (
@@ -89,11 +128,9 @@ const ChatPage = () => {
                     'whitespace-pre-wrap rounded-xl px-4 py-2 max-w-prose',
                     t.role === 'user'
                       ? 'ml-auto bg-green-600 text-white'
-                      : 'mr-auto bg-gray-200',
+                      : 'mr-auto bg-gray-200'
                   )}
-                  dangerouslySetInnerHTML={{
-                    __html: t.text.replace(/\n/g, '<br/>'),
-                  }}
+                  dangerouslySetInnerHTML={{ __html: t.text.replace(/\n/g, '<br/>') }}
                 />
               ))}
             </div>
@@ -107,19 +144,26 @@ const ChatPage = () => {
               onKeyDown={(e) => e.key === 'Enter' && sendText()}
               placeholder="Ask about your crops…"
             />
-            <Button onClick={sendText}>Send</Button>
+            <Button onClick={() => sendText()}>Send</Button>
           </div>
 
-          {/* image upload row */}
-          <div className="flex items-center gap-2 border-t px-4 pb-4">
+          {/* image upload + voice row */}
+          <div className="flex flex-wrap items-center gap-2 border-t px-4 pb-4">
             <input
-              ref={fileInputRef}
+              ref={fileInput}
               type="file"
               accept="image/*"
               className="flex-1 text-sm"
             />
             <Button onClick={sendImage} disabled={uploading}>
               {uploading ? 'Analyzing…' : 'Send photo'}
+            </Button>
+
+            <Button
+              variant={recording ? 'destructive' : 'outline'}
+              onClick={recording ? stopRec : startRec}
+            >
+              {recording ? 'Stop' : '🎤 Record'}
             </Button>
           </div>
         </CardContent>
