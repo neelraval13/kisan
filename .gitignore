@@ -1,5 +1,8 @@
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
+client_secret_496730637031-m4k0k19mldppjsr3tmcrhm7fco5atiq5.apps.googleusercontent.com.json
+midyear-bivouac-459008-g6-d00da3b3e703.json
+
 # dependencies
 /node_modules
 /.pnp
