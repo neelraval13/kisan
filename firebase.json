@@ -1,0 +1,16 @@
+{
+  "hosting": [
+    {
+      "site": "midyear-bivouac-459008-g6",
+      "source": ".",                       
+      "frameworksBackend": {
+        "codebase": "nextjs"                 
+      },
+      "ignore": [                            
+        "firebase.json",
+        "**/.*",
+        "**/node_modules/**"
+      ]
+    }
+  ]
+}
